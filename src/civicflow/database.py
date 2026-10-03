@@ -1,11 +1,15 @@
-"""SQLite 连接、事务和数据库初始化。"""
+"""SQLite 连接、事务、数据库初始化与旧库迁移。"""
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+from .audit import compute_entry_digest
+from .watermarks import create_tables, seed_watermark
 
 
 SCHEMA = r"""
@@ -20,6 +24,7 @@ CREATE TABLE IF NOT EXISTS entities (
     updated_at TEXT NOT NULL,
     created_by TEXT NOT NULL,
     updated_by TEXT NOT NULL,
+    commit_seq INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(entity_type, entity_id)
 );
 CREATE TABLE IF NOT EXISTS entity_versions (
@@ -31,9 +36,13 @@ CREATE TABLE IF NOT EXISTS entity_versions (
     valid_from TEXT NOT NULL,
     actor_id TEXT NOT NULL,
     request_key TEXT NOT NULL,
+    commit_seq INTEGER NOT NULL,
     PRIMARY KEY(entity_type, entity_id, version)
 );
-CREATE INDEX IF NOT EXISTS entity_versions_asof ON entity_versions(entity_type, entity_id, valid_from, version);
+CREATE TABLE IF NOT EXISTS commit_watermark (
+    seq_key TEXT PRIMARY KEY,
+    next_value INTEGER NOT NULL
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     scope TEXT NOT NULL,
     request_key TEXT NOT NULL,
@@ -52,7 +61,8 @@ CREATE TABLE IF NOT EXISTS audit_entries (
     version INTEGER NOT NULL,
     detail_json TEXT NOT NULL,
     previous_digest TEXT NOT NULL,
-    entry_digest TEXT NOT NULL
+    entry_digest TEXT NOT NULL,
+    commit_seq INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS inbox_messages (
     source TEXT NOT NULL,
@@ -127,6 +137,119 @@ CREATE INDEX IF NOT EXISTS jobs_due ON scheduled_jobs(status, run_at, lease_unti
 """
 
 
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate_commit_order(connection: sqlite3.Connection) -> None:
+    """为缺少水位列的旧库补齐确定顺序。
+
+    旧版本按 (业务时间, 实体内版本号, 实体类型, 实体标识) 升序分配全局
+    水位，使共享同一业务时间的写入也具有稳定、可复现的先后；随后按同一
+    顺序重建审计哈希链。迁移幂等：重复执行不会产生新水位，也不会改变
+    既有摘要。
+    """
+    if "commit_seq" not in _columns(connection, "entities"):
+        connection.execute("ALTER TABLE entities ADD COLUMN commit_seq INTEGER NOT NULL DEFAULT 0")
+
+    version_legacy = "commit_seq" not in _columns(connection, "entity_versions")
+    if version_legacy:
+        connection.execute("ALTER TABLE entity_versions ADD COLUMN commit_seq INTEGER")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS entity_versions_commit ON entity_versions(entity_type, entity_id, valid_from, commit_seq)"
+        )
+    audit_legacy = "commit_seq" not in _columns(connection, "audit_entries")
+    if audit_legacy:
+        connection.execute("ALTER TABLE audit_entries ADD COLUMN commit_seq INTEGER")
+        connection.execute("CREATE INDEX IF NOT EXISTS audit_chain_order ON audit_entries(commit_seq)")
+    create_tables(connection)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS entity_versions_commit ON entity_versions(entity_type, entity_id, valid_from, commit_seq)"
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS audit_chain_order ON audit_entries(commit_seq)")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS entity_versions_commit_seq_uq ON entity_versions(commit_seq)"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS audit_entries_commit_seq_uq ON audit_entries(commit_seq)"
+    )
+
+    pending = connection.execute(
+        "SELECT EXISTS(SELECT 1 FROM entity_versions WHERE commit_seq IS NULL) AS n"
+    ).fetchone()["n"]
+    if not version_legacy and not audit_legacy and not pending:
+        return
+
+    rows = connection.execute(
+        "SELECT entity_type, entity_id, version, valid_from FROM entity_versions "
+        "WHERE commit_seq IS NULL ORDER BY valid_from, version, entity_type, entity_id"
+    ).fetchall()
+    max_seq = 0
+    for seq, row in enumerate(rows, start=1):
+        connection.execute(
+            "UPDATE entity_versions SET commit_seq=? WHERE entity_type=? AND entity_id=? AND version=?",
+            (seq, row["entity_type"], row["entity_id"], row["version"]),
+        )
+        max_seq = seq
+    current = connection.execute("SELECT COALESCE(MAX(commit_seq),0) AS m FROM entity_versions").fetchone()["m"]
+    seed_watermark(connection, max(current, max_seq))
+
+    # 当前实体指针水位回填为该实体最新版本的水位。
+    connection.execute(
+        "UPDATE entities SET commit_seq=COALESCE(("
+        "SELECT MAX(v.commit_seq) FROM entity_versions v "
+        "WHERE v.entity_type=entities.entity_type AND v.entity_id=entities.entity_id), 0) "
+        "WHERE commit_seq=0"
+    )
+
+    # 审计行与版本行一一对应（每次写库同时产生），借实体三元组确定水位；
+    # 个别无法对应的旧行按发生时间与原自增主键追加在末尾。
+    version_seq = {
+        (row["entity_type"], row["entity_id"], row["version"]): row["commit_seq"]
+        for row in connection.execute(
+            "SELECT entity_type, entity_id, version, commit_seq FROM entity_versions"
+        )
+    }
+    audit_rows = connection.execute(
+        "SELECT audit_id, occurred_at, actor_id, action, entity_type, entity_id, version, detail_json "
+        "FROM audit_entries WHERE commit_seq IS NULL"
+    ).fetchall()
+    matched: list[tuple[int, sqlite3.Row]] = []
+    unmatched: list[sqlite3.Row] = []
+    for row in audit_rows:
+        seq = version_seq.get((row["entity_type"], row["entity_id"], row["version"]))
+        (matched if seq is not None else unmatched).append((seq, row) if seq is not None else row)
+    unmatched.sort(key=lambda r: (r["occurred_at"], r["audit_id"]))
+    ordered: list[tuple[int, sqlite3.Row]] = list(matched)
+    ordered.sort(key=lambda item: item[0])
+    next_seq = max(current, max_seq, len(matched))
+    for row in unmatched:
+        next_seq += 1
+        ordered.append((next_seq, row))
+
+    previous = "0" * 64
+    for seq, row in ordered:
+        detail = json.loads(row["detail_json"])
+        digest = compute_entry_digest(
+            occurred_at=row["occurred_at"],
+            actor_id=row["actor_id"],
+            action=row["action"],
+            entity_type=row["entity_type"],
+            entity_id=row["entity_id"],
+            version=row["version"],
+            commit_seq=seq,
+            detail=detail,
+            previous=previous,
+        )
+        connection.execute(
+            "UPDATE audit_entries SET commit_seq=?, previous_digest=?, entry_digest=? WHERE audit_id=?",
+            (seq, previous, digest, row["audit_id"]),
+        )
+        previous = digest
+    if ordered:
+        seed_watermark(connection, next_seq)
+
+
 class Database:
     def __init__(self, path: str | Path):
         self.path = str(path)
@@ -142,6 +265,7 @@ class Database:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            _migrate_commit_order(connection)
 
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
