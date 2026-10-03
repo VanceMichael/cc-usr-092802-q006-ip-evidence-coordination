@@ -40,4 +40,4 @@ class CivicFlow:
             audit_count = AuditLog(self.clock).verify(connection)
             entity_count = connection.execute("SELECT COUNT(*) AS n FROM entities").fetchone()["n"]
             conflict_count = connection.execute("SELECT COUNT(*) AS n FROM inbox_conflicts").fetchone()["n"]
-        return {"audit_entries": audit_count, "entities": entity_count, "inbox_conflicts": conflict_count}
+        return {"audit_entries": audit_count, "entities": entity_count, "inbox_conflicts": conflict_count, "write_watermark": self.repository.current_watermark()}

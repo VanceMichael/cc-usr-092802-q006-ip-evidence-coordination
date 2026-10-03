@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Iterator
 
 
+WRITE_SEQ_COUNTER = "entity_write_seq"
+
 SCHEMA = r"""
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS entities (
@@ -20,6 +22,7 @@ CREATE TABLE IF NOT EXISTS entities (
     updated_at TEXT NOT NULL,
     created_by TEXT NOT NULL,
     updated_by TEXT NOT NULL,
+    write_seq INTEGER,
     PRIMARY KEY(entity_type, entity_id)
 );
 CREATE TABLE IF NOT EXISTS entity_versions (
@@ -31,9 +34,14 @@ CREATE TABLE IF NOT EXISTS entity_versions (
     valid_from TEXT NOT NULL,
     actor_id TEXT NOT NULL,
     request_key TEXT NOT NULL,
+    write_seq INTEGER,
     PRIMARY KEY(entity_type, entity_id, version)
 );
 CREATE INDEX IF NOT EXISTS entity_versions_asof ON entity_versions(entity_type, entity_id, valid_from, version);
+CREATE TABLE IF NOT EXISTS sequence_counters (
+    name TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     scope TEXT NOT NULL,
     request_key TEXT NOT NULL,
@@ -142,6 +150,33 @@ class Database:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """把既有历史数据升级到带写入水位的结构，可重复执行。"""
+        with self.transaction() as connection:
+            version_columns = {row["name"] for row in connection.execute("PRAGMA table_info(entity_versions)")}
+            if "write_seq" not in version_columns:
+                connection.execute("ALTER TABLE entity_versions ADD COLUMN write_seq INTEGER")
+            entity_columns = {row["name"] for row in connection.execute("PRAGMA table_info(entities)")}
+            if "write_seq" not in entity_columns:
+                connection.execute("ALTER TABLE entities ADD COLUMN write_seq INTEGER")
+            # 旧数据没有水位：rowid 即历史插入顺序，据此生成确定且与审计链一致的先后水位。
+            pending = connection.execute("SELECT rowid AS rid FROM entity_versions WHERE write_seq IS NULL ORDER BY rowid").fetchall()
+            if pending:
+                offset = connection.execute("SELECT COALESCE(MAX(write_seq), 0) AS value FROM entity_versions").fetchone()["value"]
+                for step, row in enumerate(pending, start=1):
+                    connection.execute("UPDATE entity_versions SET write_seq=? WHERE rowid=?", (offset + step, row["rid"]))
+            connection.execute(
+                "UPDATE entities SET write_seq=(SELECT ev.write_seq FROM entity_versions ev WHERE ev.entity_type=entities.entity_type AND ev.entity_id=entities.entity_id AND ev.version=entities.version) WHERE write_seq IS NULL"
+            )
+            highest = connection.execute("SELECT COALESCE(MAX(write_seq), 0) AS value FROM entity_versions").fetchone()["value"]
+            connection.execute(
+                "INSERT INTO sequence_counters(name, value) VALUES(?, ?) ON CONFLICT(name) DO UPDATE SET value=MAX(value, excluded.value)",
+                (WRITE_SEQ_COUNTER, highest),
+            )
+            connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS entity_versions_write_seq ON entity_versions(write_seq)")
+            connection.execute("CREATE INDEX IF NOT EXISTS entity_versions_asof_seq ON entity_versions(entity_type, entity_id, valid_from, write_seq)")
 
     @contextmanager
     def transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
